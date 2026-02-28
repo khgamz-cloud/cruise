@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Круизы и каюты{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+</head>
+<body>
+<header class="site-header">
+  <div class="container nav-wrap">
+    <a href="{{ url_for('index') }}" class="logo">Круизы и каюты</a>
+    <nav class="nav">
+      <a href="{{ url_for('index') }}">Круизы</a>
+      {% if current_user %}
+        <a href="{{ url_for('orders') }}">Мои заказы</a>
+        <a href="{{ url_for('reports') }}">Отчётность</a>
+        {% if current_user.role_code == 'admin' %}
+          <a href="{{ url_for('admin') }}">Админ</a>
+        {% endif %}
+        <a href="{{ url_for('logout') }}">Выход</a>
+      {% else %}
+        <a href="{{ url_for('login') }}">Вход</a>
+        <a href="{{ url_for('register') }}">Регистрация</a>
+      {% endif %}
+    </nav>
+  </div>
+</header>
+
+<main class="container main-content">
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <div class="flash-stack">
+        {% for category, message in messages %}
+          <div class="flash {{ category }}">{{ message }}</div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <small>© {{ now_year }} «Круизы и каюты»</small>
+  </div>
+</footer>
+</body>
+</html>

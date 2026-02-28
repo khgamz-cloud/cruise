@@ -1,0 +1,585 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import sqlite3
+from contextlib import closing
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from flask import (
+    Flask,
+    flash,
+    g,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
+from werkzeug.security import check_password_hash, generate_password_hash
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "data" / "cruises.db"
+
+LOGIN_RE = re.compile(r"^[A-Za-z0-9]{6,}$")
+PHONE_RE = re.compile(r"^8\([0-9]{3}\)[0-9]{3}-[0-9]{2}-[0-9]{2}$")
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+FULLNAME_RE = re.compile(r"^[А-Яа-яЁё\- ]{5,}$")
+
+
+app = Flask(__name__)
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+
+
+# ---------- Database helpers ----------
+def get_db() -> sqlite3.Connection:
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys = ON")
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(_: Any) -> None:
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+
+def query_db(query: str, args: tuple[Any, ...] = (), one: bool = False):
+    cur = get_db().execute(query, args)
+    rows = cur.fetchall()
+    cur.close()
+    return (rows[0] if rows else None) if one else rows
+
+
+def execute_db(query: str, args: tuple[Any, ...] = ()) -> int:
+    db = get_db()
+    cur = db.execute(query, args)
+    db.commit()
+    lastrowid = cur.lastrowid
+    cur.close()
+    return lastrowid
+
+
+def init_db() -> None:
+    schema_path = BASE_DIR / "schema.sql"
+    with closing(sqlite3.connect(DB_PATH)) as db:
+        db.executescript(schema_path.read_text(encoding="utf-8"))
+        db.commit()
+
+
+# ---------- Auth helpers ----------
+def current_user() -> sqlite3.Row | None:
+    user_id = session.get("user_id")
+    if not user_id:
+        return None
+    return query_db(
+        "SELECT u.*, r.code AS role_code, r.name AS role_name FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ?",
+        (user_id,),
+        one=True,
+    )
+
+
+def login_required(admin: bool = False):
+    def decorator(view_func):
+        def wrapped(*args, **kwargs):
+            user = current_user()
+            if not user:
+                flash("Сначала выполните вход.", "error")
+                return redirect(url_for("login"))
+            if admin and user["role_code"] != "admin":
+                flash("Доступ разрешён только администратору.", "error")
+                return redirect(url_for("index"))
+            return view_func(*args, **kwargs)
+
+        wrapped.__name__ = view_func.__name__
+        return wrapped
+
+    return decorator
+
+
+@app.context_processor
+def inject_globals() -> dict[str, Any]:
+    return {
+        "current_user": current_user(),
+        "now_year": datetime.now().year,
+    }
+
+
+def log_auth(user_id: int | None, attempted_login: str, success: bool, reason: str) -> None:
+    execute_db(
+        """
+        INSERT INTO auth_log(user_id, attempted_login, ip, user_agent, is_success, reason, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            attempted_login,
+            request.remote_addr,
+            request.headers.get("User-Agent", "")[:255],
+            1 if success else 0,
+            reason,
+            datetime.now().isoformat(sep=" ", timespec="seconds"),
+        ),
+    )
+
+
+# ---------- Business helpers ----------
+def release_expired_reservations() -> None:
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    db = get_db()
+    db.execute(
+        "UPDATE tickets SET status = 'free', order_id = NULL, reserved_until = NULL, updated_at = ? "
+        "WHERE status = 'reserved' AND reserved_until IS NOT NULL AND reserved_until < ?",
+        (now, now),
+    )
+    db.commit()
+
+
+def ensure_tickets_for_performance(performance_id: int) -> None:
+    db = get_db()
+    performance = query_db(
+        "SELECT id, base_price, ship_id FROM performances WHERE id = ?", (performance_id,), one=True
+    )
+    if not performance:
+        return
+    cabins = query_db("SELECT * FROM cabins WHERE ship_id = ?", (performance["ship_id"],))
+    existing = {row["cabin_id"] for row in query_db("SELECT cabin_id FROM tickets WHERE performance_id = ?", (performance_id,))}
+    for cabin in cabins:
+        if cabin["id"] in existing:
+            continue
+        price = round(float(performance["base_price"]) * float(cabin["price_mult"]), 2)
+        db.execute(
+            """
+            INSERT INTO tickets(performance_id, cabin_id, status, price, order_id, reserved_until, updated_at)
+            VALUES (?, ?, 'free', ?, NULL, NULL, ?)
+            """,
+            (performance_id, cabin["id"], price, datetime.now().isoformat(sep=" ", timespec="seconds")),
+        )
+    db.commit()
+
+
+def performance_filters() -> tuple[list[sqlite3.Row], list[sqlite3.Row], list[sqlite3.Row]]:
+    directions = query_db("SELECT DISTINCT direction FROM cruises ORDER BY direction")
+    ships = query_db("SELECT id, name FROM ships ORDER BY name")
+    durations = query_db("SELECT DISTINCT duration_days FROM cruises ORDER BY duration_days")
+    return directions, ships, durations
+
+
+# ---------- Routes ----------
+@app.route("/")
+def home():
+    return redirect(url_for("index"))
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "POST":
+        login = request.form.get("login", "").strip()
+        password = request.form.get("password", "")
+        full_name = request.form.get("full_name", "").strip()
+        phone = request.form.get("phone", "").strip()
+        email = request.form.get("email", "").strip()
+        terms = request.form.get("terms")
+
+        errors = []
+        if not LOGIN_RE.fullmatch(login):
+            errors.append("Логин должен содержать только латиницу и цифры, минимум 6 символов.")
+        if len(password) < 8:
+            errors.append("Пароль должен содержать не менее 8 символов.")
+        if not FULLNAME_RE.fullmatch(full_name):
+            errors.append("ФИО должно быть на кириллице, не короче 5 символов.")
+        if not PHONE_RE.fullmatch(phone):
+            errors.append("Телефон должен быть в формате 8(XXX)XXX-XX-XX.")
+        if not EMAIL_RE.fullmatch(email):
+            errors.append("Укажите корректный e-mail.")
+        if not terms:
+            errors.append("Нужно принять условия обработки персональных данных.")
+        existing = query_db("SELECT id FROM users WHERE login = ?", (login,), one=True)
+        if existing:
+            errors.append("Пользователь с таким логином уже существует.")
+
+        if errors:
+            for error in errors:
+                flash(error, "error")
+            return render_template("register.htm")
+
+        role = query_db("SELECT id FROM roles WHERE code = 'client'", one=True)
+        user_id = execute_db(
+            """
+            INSERT INTO users(login, password_hash, full_name, phone, email, role_id, is_active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (
+                login,
+                generate_password_hash(password),
+                full_name,
+                phone,
+                email,
+                role["id"],
+                datetime.now().isoformat(sep=" ", timespec="seconds"),
+                datetime.now().isoformat(sep=" ", timespec="seconds"),
+            ),
+        )
+        log_auth(user_id, login, True, "registered")
+        execute_db(
+            "INSERT INTO email_queue(recipient, subject, body_text, is_sent, created_at) VALUES (?, ?, ?, 0, ?)",
+            (
+                email,
+                "Добро пожаловать в систему «Круизы и каюты»",
+                f"Здравствуйте, {full_name}! Ваш аккаунт успешно создан.",
+                datetime.now().isoformat(sep=" ", timespec="seconds"),
+            ),
+        )
+        session["user_id"] = user_id
+        flash("Регистрация прошла успешно. Вы вошли в систему.", "success")
+        return redirect(url_for("index"))
+
+    return render_template("register.htm")
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        login_value = request.form.get("login", "").strip()
+        password = request.form.get("password", "")
+        user = query_db(
+            "SELECT u.*, r.code AS role_code FROM users u JOIN roles r ON r.id = u.role_id WHERE login = ?",
+            (login_value,),
+            one=True,
+        )
+        if user is None:
+            log_auth(None, login_value, False, "no_user")
+            flash("Неверный логин или пароль.", "error")
+            return render_template("login.htm")
+        if not user["is_active"]:
+            log_auth(user["id"], login_value, False, "locked")
+            flash("Учётная запись заблокирована.", "error")
+            return render_template("login.htm")
+        if not check_password_hash(user["password_hash"], password):
+            log_auth(user["id"], login_value, False, "bad_password")
+            flash("Неверный логин или пароль.", "error")
+            return render_template("login.htm")
+
+        session["user_id"] = user["id"]
+        log_auth(user["id"], login_value, True, "ok")
+        flash("Вход выполнен успешно.", "success")
+        return redirect(url_for("index"))
+
+    return render_template("login.htm")
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    flash("Вы вышли из аккаунта.", "success")
+    return redirect(url_for("login"))
+
+
+@app.route("/index")
+def index():
+    release_expired_reservations()
+    directions, ships, durations = performance_filters()
+    selected_direction = request.args.get("direction", "")
+    selected_ship = request.args.get("ship_id", "")
+    selected_duration = request.args.get("duration_days", "")
+    selected_date = request.args.get("departure_date", "")
+    selected_performance_id = request.args.get("performance_id", "")
+
+    query = """
+        SELECT p.id, p.starts_at, p.base_price, p.status,
+               c.name AS cruise_name, c.direction, c.duration_days, c.includes,
+               s.name AS ship_name, s.capacity,
+               GROUP_CONCAT(cp.port_name, ' • ') AS ports
+        FROM performances p
+        JOIN cruises c ON c.id = p.cruise_id
+        JOIN ships s ON s.id = p.ship_id
+        LEFT JOIN cruise_ports cp ON cp.cruise_id = c.id
+        WHERE 1=1
+    """
+    params: list[Any] = []
+    if selected_direction:
+        query += " AND c.direction = ?"
+        params.append(selected_direction)
+    if selected_ship:
+        query += " AND s.id = ?"
+        params.append(selected_ship)
+    if selected_duration:
+        query += " AND c.duration_days = ?"
+        params.append(selected_duration)
+    if selected_date:
+        query += " AND date(p.starts_at) = date(?)"
+        params.append(selected_date)
+    query += " GROUP BY p.id ORDER BY p.starts_at"
+    cruises = query_db(query, tuple(params))
+
+    selected_performance = None
+    cabins = []
+    if selected_performance_id:
+        selected_performance = query_db(
+            """
+            SELECT p.*, c.name AS cruise_name, c.direction, c.duration_days, c.includes,
+                   s.name AS ship_name
+            FROM performances p
+            JOIN cruises c ON c.id = p.cruise_id
+            JOIN ships s ON s.id = p.ship_id
+            WHERE p.id = ?
+            """,
+            (selected_performance_id,),
+            one=True,
+        )
+        if selected_performance:
+            ensure_tickets_for_performance(int(selected_performance_id))
+            cabins = query_db(
+                """
+                SELECT t.id AS ticket_id, t.status, t.price, t.reserved_until,
+                       cb.id AS cabin_id, cb.cabin_number, cb.category, cb.deck, cb.capacity, cb.price_mult
+                FROM tickets t
+                JOIN cabins cb ON cb.id = t.cabin_id
+                WHERE t.performance_id = ?
+                ORDER BY cb.deck, cb.cabin_number
+                """,
+                (selected_performance_id,),
+            )
+
+    return render_template(
+        "index.htm",
+        cruises=cruises,
+        directions=directions,
+        ships=ships,
+        durations=durations,
+        selected_direction=selected_direction,
+        selected_ship=selected_ship,
+        selected_duration=selected_duration,
+        selected_date=selected_date,
+        selected_performance=selected_performance,
+        selected_performance_id=selected_performance_id,
+        cabins=cabins,
+    )
+
+
+@app.route("/reserve", methods=["POST"])
+@login_required()
+def reserve():
+    release_expired_reservations()
+    performance_id = int(request.form.get("performance_id", "0"))
+    ticket_ids = request.form.getlist("ticket_ids")
+    passengers = int(request.form.get("passengers", "1"))
+    payment_method_id = int(request.form.get("payment_method_id", "0"))
+    email_to = request.form.get("email_to", "").strip()
+
+    if not ticket_ids:
+        flash("Выберите хотя бы одну каюту.", "error")
+        return redirect(url_for("index", performance_id=performance_id))
+    if passengers < 1:
+        flash("Количество пассажиров должно быть не меньше 1.", "error")
+        return redirect(url_for("index", performance_id=performance_id))
+    if not EMAIL_RE.fullmatch(email_to):
+        flash("Укажите корректный e-mail для подтверждения.", "error")
+        return redirect(url_for("index", performance_id=performance_id))
+
+    db = get_db()
+    now = datetime.now()
+    try:
+        total_amount = 0.0
+        chosen_tickets: list[sqlite3.Row] = []
+        for ticket_id in ticket_ids:
+            ticket = db.execute(
+                "SELECT t.*, cb.capacity, cb.cabin_number FROM tickets t JOIN cabins cb ON cb.id = t.cabin_id WHERE t.id = ? AND t.performance_id = ?",
+                (ticket_id, performance_id),
+            ).fetchone()
+            if not ticket or ticket["status"] != "free":
+                raise ValueError(f"Каюта {ticket['cabin_number'] if ticket else ''} уже недоступна.")
+            chosen_tickets.append(ticket)
+            total_amount += float(ticket["price"])
+
+        order_id = db.execute(
+            """
+            INSERT INTO orders(buyer_user_id, email_to, passengers_count, payment_method_id, payment_status, total_amount, status, created_at, paid_at)
+            VALUES (?, ?, ?, ?, 'pending', ?, 'new', ?, NULL)
+            """,
+            (
+                session["user_id"],
+                email_to,
+                passengers,
+                payment_method_id,
+                round(total_amount, 2),
+                now.isoformat(sep=" ", timespec="seconds"),
+            ),
+        ).lastrowid
+
+        reserved_until = now + timedelta(minutes=15)
+        payment_method = db.execute("SELECT code FROM payment_methods WHERE id = ?", (payment_method_id,)).fetchone()
+        ticket_status = "reserved" if payment_method and payment_method["code"] == "online" else "sold"
+        order_payment_status = "pending" if ticket_status == "reserved" else "paid"
+        order_status = "new" if ticket_status == "reserved" else "confirmed"
+
+        for ticket in chosen_tickets:
+            db.execute(
+                "UPDATE tickets SET status = ?, order_id = ?, reserved_until = ?, updated_at = ? WHERE id = ?",
+                (
+                    ticket_status,
+                    order_id,
+                    reserved_until.isoformat(sep=" ", timespec="seconds") if ticket_status == "reserved" else None,
+                    now.isoformat(sep=" ", timespec="seconds"),
+                    ticket["id"],
+                ),
+            )
+
+        db.execute(
+            "UPDATE orders SET payment_status = ?, status = ?, paid_at = ? WHERE id = ?",
+            (
+                order_payment_status,
+                order_status,
+                now.isoformat(sep=" ", timespec="seconds") if order_payment_status == "paid" else None,
+                order_id,
+            ),
+        )
+
+        pay_status = "captured" if order_payment_status == "paid" else "initiated"
+        db.execute(
+            "INSERT INTO payments(order_id, method_id, amount, currency, status, transaction_ref, created_at) VALUES (?, ?, ?, 'RUB', ?, ?, ?)",
+            (
+                order_id,
+                payment_method_id,
+                round(total_amount, 2),
+                pay_status,
+                f"TRX-{order_id}-{int(now.timestamp())}",
+                now.isoformat(sep=" ", timespec="seconds"),
+            ),
+        )
+        db.execute(
+            "INSERT INTO email_queue(recipient, subject, body_text, is_sent, created_at) VALUES (?, ?, ?, 0, ?)",
+            (
+                email_to,
+                f"Подтверждение бронирования #{order_id}",
+                f"Ваш заказ #{order_id} оформлен. Статус оплаты: {order_payment_status}.",
+                now.isoformat(sep=" ", timespec="seconds"),
+            ),
+        )
+        db.commit()
+        flash(
+            f"Заказ #{order_id} создан. Статус: {order_status}. {'Оплатите онлайн в течение 15 минут.' if order_payment_status == 'pending' else 'Оплата подтверждена.'}",
+            "success",
+        )
+    except ValueError as exc:
+        db.rollback()
+        flash(str(exc), "error")
+    return redirect(url_for("index", performance_id=performance_id))
+
+
+@app.route("/reports")
+@login_required()
+def reports():
+    sales = query_db("SELECT * FROM v_sales_by_performance ORDER BY starts_at")
+    occupancy = query_db("SELECT * FROM v_occupancy ORDER BY starts_at")
+    revenue = query_db("SELECT * FROM v_revenue_daily ORDER BY day")
+    return render_template("reports.htm", sales=sales, occupancy=occupancy, revenue=revenue)
+
+
+@app.route("/admin", methods=["GET", "POST"])
+@login_required(admin=True)
+def admin():
+    db = get_db()
+    if request.method == "POST":
+        action = request.form.get("action")
+        now = datetime.now().isoformat(sep=" ", timespec="seconds")
+        if action == "toggle_user":
+            user_id = int(request.form.get("user_id", "0"))
+            user = db.execute("SELECT is_active FROM users WHERE id = ?", (user_id,)).fetchone()
+            if user:
+                db.execute("UPDATE users SET is_active = ?, updated_at = ? WHERE id = ?", (0 if user["is_active"] else 1, now, user_id))
+                db.commit()
+                flash("Статус пользователя обновлён.", "success")
+        elif action == "save_setting":
+            min_length = int(request.form.get("min_length", "8"))
+            require_digits = 1 if request.form.get("require_digits") else 0
+            require_upper = 1 if request.form.get("require_upper") else 0
+            lock_threshold = int(request.form.get("lock_threshold", "5"))
+            payload = json.dumps(
+                {
+                    "min_length": min_length,
+                    "require_digits": bool(require_digits),
+                    "require_upper": bool(require_upper),
+                    "lock_threshold": lock_threshold,
+                },
+                ensure_ascii=False,
+            )
+            db.execute("UPDATE admin_settings SET svalue = ?, updated_at = ? WHERE skey = 'security.password_policy'", (payload, now))
+            db.commit()
+            flash("Политика безопасности сохранена.", "success")
+        elif action == "save_integration":
+            name = request.form.get("name", "").strip()
+            integ_type = request.form.get("type", "email").strip()
+            is_active = 1 if request.form.get("is_active") else 0
+            config = request.form.get("config", "{}")
+            db.execute(
+                "INSERT INTO integrations(type, name, config, is_active, created_at) VALUES (?, ?, ?, ?, ?)",
+                (integ_type, name, config, is_active, now),
+            )
+            db.commit()
+            flash("Интеграция добавлена.", "success")
+        elif action == "add_backup":
+            status = request.form.get("backup_status", "success")
+            location = request.form.get("location", "")
+            message = request.form.get("message", "")
+            db.execute(
+                "INSERT INTO backup_log(started_at, finished_at, status, location, message) VALUES (?, ?, ?, ?, ?)",
+                (now, now, status, location, message),
+            )
+            db.commit()
+            flash("Запись о резервном копировании добавлена.", "success")
+        return redirect(url_for("admin"))
+
+    settings_row = query_db("SELECT * FROM admin_settings WHERE skey = 'security.password_policy'", one=True)
+    settings = json.loads(settings_row["svalue"])
+    users = query_db(
+        "SELECT u.id, u.login, u.full_name, u.email, u.is_active, r.name AS role_name FROM users u JOIN roles r ON r.id = u.role_id ORDER BY u.id"
+    )
+    integrations = query_db("SELECT * FROM integrations ORDER BY created_at DESC")
+    backups = query_db("SELECT * FROM backup_log ORDER BY started_at DESC")
+    auth_logs = query_db(
+        "SELECT al.*, u.login AS real_login FROM auth_log al LEFT JOIN users u ON u.id = al.user_id ORDER BY al.created_at DESC LIMIT 15"
+    )
+    return render_template(
+        "admin.htm",
+        settings=settings,
+        users=users,
+        integrations=integrations,
+        backups=backups,
+        auth_logs=auth_logs,
+    )
+
+
+@app.route("/orders")
+@login_required()
+def orders():
+    items = query_db(
+        """
+        SELECT o.id, o.status, o.payment_status, o.total_amount, o.created_at,
+               p.starts_at, c.name AS cruise_name, s.name AS ship_name,
+               GROUP_CONCAT(cb.cabin_number, ', ') AS cabins
+        FROM orders o
+        JOIN performances p ON p.id = (SELECT performance_id FROM tickets WHERE order_id = o.id LIMIT 1)
+        JOIN cruises c ON c.id = p.cruise_id
+        JOIN ships s ON s.id = p.ship_id
+        LEFT JOIN tickets t ON t.order_id = o.id
+        LEFT JOIN cabins cb ON cb.id = t.cabin_id
+        WHERE o.buyer_user_id = ?
+        GROUP BY o.id
+        ORDER BY o.created_at DESC
+        """,
+        (session["user_id"],),
+    )
+    return render_template("orders.htm", orders=items)
+
+
+if __name__ == "__main__":
+    if not DB_PATH.exists():
+        init_db()
+    app.run(debug=True)

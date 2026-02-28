@@ -1,0 +1,133 @@
+{% extends 'base.htm' %}
+{% block title %}Админ-панель — Круизы и каюты{% endblock %}
+{% block content %}
+<section class="hero compact">
+  <h1>Панель администратора</h1>
+  <p class="muted">Управление настройками безопасности, интеграциями, резервными копиями, пользователями и журналом авторизации.</p>
+</section>
+
+<section class="card">
+  <h2>Политика безопасности</h2>
+  <form method="post" class="grid-4">
+    <input type="hidden" name="action" value="save_setting">
+    <div class="form-row">
+      <label for="min_length">Мин. длина пароля</label>
+      <input id="min_length" name="min_length" type="number" min="8" value="{{ settings.min_length }}">
+    </div>
+    <div class="form-row checkbox-cell">
+      <label class="checkbox"><input type="checkbox" name="require_digits" {% if settings.require_digits %}checked{% endif %}><span>Требовать цифры</span></label>
+    </div>
+    <div class="form-row checkbox-cell">
+      <label class="checkbox"><input type="checkbox" name="require_upper" {% if settings.require_upper %}checked{% endif %}><span>Требовать заглавные</span></label>
+    </div>
+    <div class="form-row">
+      <label for="lock_threshold">Блокировка после N ошибок</label>
+      <input id="lock_threshold" name="lock_threshold" type="number" min="3" value="{{ settings.lock_threshold }}">
+    </div>
+    <div class="form-actions grid-full"><button class="btn primary" type="submit">Сохранить настройки</button></div>
+  </form>
+</section>
+
+<section class="cards-grid two-up mt-24">
+  <div class="card">
+    <h2>Интеграции</h2>
+    <div class="table-scroll small-table">
+      <table class="table">
+        <thead><tr><th>Тип</th><th>Название</th><th>Статус</th></tr></thead>
+        <tbody>
+          {% for row in integrations %}
+          <tr>
+            <td>{{ row.type }}</td>
+            <td>{{ row.name }}</td>
+            <td><span class="badge {% if row.is_active %}ok{% else %}warn{% endif %}">{{ 'Активна' if row.is_active else 'Отключена' }}</span></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <form method="post" class="grid-2 mt-16">
+      <input type="hidden" name="action" value="save_integration">
+      <div class="form-row"><label for="type">Тип</label><select id="type" name="type"><option value="email">email</option><option value="payment">payment</option><option value="analytics">analytics</option></select></div>
+      <div class="form-row"><label for="name">Название</label><input id="name" name="name" type="text" required></div>
+      <div class="form-row grid-full"><label for="config">JSON-конфиг</label><textarea id="config" name="config" rows="4">{"demo": true}</textarea></div>
+      <div class="form-row checkbox-cell"><label class="checkbox"><input type="checkbox" name="is_active"><span>Активировать</span></label></div>
+      <div class="form-actions"><button class="btn primary" type="submit">Добавить интеграцию</button></div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Резервные копии</h2>
+    <div class="table-scroll small-table">
+      <table class="table">
+        <thead><tr><th>Дата</th><th>Статус</th><th>Путь</th></tr></thead>
+        <tbody>
+          {% for row in backups %}
+          <tr>
+            <td>{{ row.started_at }}</td>
+            <td><span class="badge {% if row.status == 'success' %}ok{% else %}err{% endif %}">{{ row.status }}</span></td>
+            <td>{{ row.location }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <form method="post" class="grid-2 mt-16">
+      <input type="hidden" name="action" value="add_backup">
+      <div class="form-row"><label for="backup_status">Статус</label><select id="backup_status" name="backup_status"><option value="success">success</option><option value="failed">failed</option></select></div>
+      <div class="form-row"><label for="location">Путь</label><input id="location" name="location" type="text" placeholder="/backup/file.sql"></div>
+      <div class="form-row grid-full"><label for="message">Комментарий</label><textarea id="message" name="message" rows="3"></textarea></div>
+      <div class="form-actions"><button class="btn primary" type="submit">Добавить запись</button></div>
+    </form>
+  </div>
+</section>
+
+<section class="card mt-24">
+  <h2>Пользователи</h2>
+  <div class="table-scroll">
+    <table class="table">
+      <thead><tr><th>Логин</th><th>ФИО</th><th>E-mail</th><th>Роль</th><th>Статус</th><th>Действие</th></tr></thead>
+      <tbody>
+        {% for row in users %}
+        <tr>
+          <td>{{ row.login }}</td>
+          <td>{{ row.full_name }}</td>
+          <td>{{ row.email }}</td>
+          <td>{{ row.role_name }}</td>
+          <td><span class="badge {% if row.is_active %}ok{% else %}err{% endif %}">{{ 'Активен' if row.is_active else 'Заблокирован' }}</span></td>
+          <td>
+            {% if row.login != 'admin123' %}
+            <form method="post">
+              <input type="hidden" name="action" value="toggle_user">
+              <input type="hidden" name="user_id" value="{{ row.id }}">
+              <button class="btn small" type="submit">{{ 'Блокировать' if row.is_active else 'Разблокировать' }}</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="card mt-24">
+  <h2>Журнал входов</h2>
+  <div class="table-scroll">
+    <table class="table">
+      <thead><tr><th>Время</th><th>Попытка</th><th>IP</th><th>Результат</th><th>Причина</th></tr></thead>
+      <tbody>
+        {% for row in auth_logs %}
+        <tr>
+          <td>{{ row.created_at }}</td>
+          <td>{{ row.attempted_login }}</td>
+          <td>{{ row.ip }}</td>
+          <td><span class="badge {% if row.is_success %}ok{% else %}err{% endif %}">{{ 'Успех' if row.is_success else 'Ошибка' }}</span></td>
+          <td>{{ row.reason }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}
